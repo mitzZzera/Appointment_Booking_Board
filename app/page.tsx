@@ -1,2 +1,2 @@
-import BookingBoard from './BookingBoard';
-export default function Home(){return <BookingBoard/>}
+import BookingBoardNext from './BookingBoardNext';
+export default function Home(){return <BookingBoardNext/>}
