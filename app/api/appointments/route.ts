@@ -2,34 +2,12 @@ import { and, desc, eq } from 'drizzle-orm';
 import { getDb } from '../../../db';
 import { appointments } from '../../../db/schema';
 import { getChatGPTUser } from '../../chatgpt-auth';
-
-type NewAppointment = { customerName?:string; customerEmail?:string; customerPhone?:string; service?:string; staffName?:string; appointmentDate?:string; startTime?:string; durationMins?:number; notes?:string; price?:number };
-
-export async function GET() {
-  const user = await getChatGPTUser();
-  if (!user) return Response.json({ error:'Sign in required' }, { status:401 });
-  try { const rows = await getDb().select().from(appointments).where(eq(appointments.ownerId,user.userId)).orderBy(desc(appointments.appointmentDate),desc(appointments.startTime)).limit(100); return Response.json({ appointments:rows }); }
-  catch { return Response.json({ appointments:[] }); }
-}
-
-export async function POST(request:Request) {
-  const user = await getChatGPTUser();
-  if (!user) return Response.json({ error:'Sign in required' }, { status:401 });
-  try {
-    const data=(await request.json()) as NewAppointment;
-    const customerName=data.customerName?.trim()??'',service=data.service?.trim()??'',staffName=data.staffName?.trim()??'',appointmentDate=data.appointmentDate??'',startTime=data.startTime??'',durationMins=Number(data.durationMins);
-    if(!customerName||!service||!staffName||!/^\d{4}-\d{2}-\d{2}$/.test(appointmentDate)||!/^\d{2}:\d{2}$/.test(startTime)||!Number.isInteger(durationMins)||durationMins<15||durationMins>240)return Response.json({error:'Please complete all required booking details.'},{status:400});
-    const sameDay=await getDb().select().from(appointments).where(and(eq(appointments.ownerId,user.userId),eq(appointments.appointmentDate,appointmentDate),eq(appointments.staffName,staffName))).limit(50);
-    const start=toMinutes(startTime),end=start+durationMins;const conflict=sameDay.some(a=>a.status!=='cancelled'&&start<toMinutes(a.startTime)+a.durationMins&&end>toMinutes(a.startTime));
-    if(conflict)return Response.json({error:`${staffName} already has a booking during that time.`},{status:409});
-    const [saved]=await getDb().insert(appointments).values({ownerId:user.userId,customerName,customerEmail:data.customerEmail?.trim()??'',customerPhone:data.customerPhone?.trim()??'',service,staffName,appointmentDate,startTime,durationMins,notes:data.notes?.trim()??'',price:Math.max(0,Number(data.price)||0)}).returning();
-    return Response.json({appointment:saved},{status:201});
-  } catch { return Response.json({error:'The booking could not be saved.'},{status:500}); }
-}
-
-export async function PATCH(request:Request) {
-  const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required'},{status:401});
-  try{const data=(await request.json()) as {id?:number;status?:string};if(!data.id||!['confirmed','completed','cancelled','no-show'].includes(data.status??''))return Response.json({error:'Invalid status update.'},{status:400});const [updated]=await getDb().update(appointments).set({status:data.status}).where(and(eq(appointments.id,data.id),eq(appointments.ownerId,user.userId))).returning();if(!updated)return Response.json({error:'Booking not found.'},{status:404});return Response.json({appointment:updated});}catch{return Response.json({error:'The booking could not be updated.'},{status:500});}
-}
-
-function toMinutes(value:string){const [hours,minutes]=value.split(':').map(Number);return hours*60+minutes;}
+type Payload={id?:number;customerName?:string;customerEmail?:string;customerPhone?:string;service?:string;staffName?:string;appointmentDate?:string;startTime?:string;durationMins?:number;status?:string;notes?:string;price?:number};
+export async function GET(){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required'},{status:401});try{return Response.json({appointments:await getDb().select().from(appointments).where(eq(appointments.ownerId,user.userId)).orderBy(desc(appointments.appointmentDate),desc(appointments.startTime)).limit(500)});}catch{return Response.json({appointments:[]});}}
+function valid(d:Payload){return !!d.customerName?.trim()&&!!d.service?.trim()&&!!d.staffName?.trim()&&/^\d{4}-\d{2}-\d{2}$/.test(d.appointmentDate??'')&&/^\d{2}:\d{2}$/.test(d.startTime??'')&&Number(d.durationMins)>=15}
+function fields(d:Payload){return {customerName:d.customerName!.trim(),customerEmail:d.customerEmail?.trim()??'',customerPhone:d.customerPhone?.trim()??'',service:d.service!.trim(),staffName:d.staffName!.trim(),appointmentDate:d.appointmentDate!,startTime:d.startTime!,durationMins:Number(d.durationMins),status:d.status??'confirmed',notes:d.notes?.trim()??'',price:Math.max(0,Number(d.price)||0)}}
+async function conflicts(ownerId:string,d:Payload,skip?:number){const rows=await getDb().select().from(appointments).where(and(eq(appointments.ownerId,ownerId),eq(appointments.appointmentDate,d.appointmentDate!),eq(appointments.staffName,d.staffName!))).limit(100),start=mins(d.startTime!),end=start+Number(d.durationMins);return rows.some(a=>a.id!==skip&&a.status!=='cancelled'&&start<mins(a.startTime)+a.durationMins&&end>mins(a.startTime))}
+export async function POST(req:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required'},{status:401});try{const d=await req.json() as Payload;if(!valid(d))return Response.json({error:'Complete the required fields.'},{status:400});if(await conflicts(user.userId,d))return Response.json({error:'That time conflicts with another booking.'},{status:409});const [saved]=await getDb().insert(appointments).values({ownerId:user.userId,...fields(d)}).returning();return Response.json({appointment:saved},{status:201});}catch{return Response.json({error:'Booking could not be saved.'},{status:500});}}
+export async function PATCH(req:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required'},{status:401});try{const d=await req.json() as Payload;if(!d.id)return Response.json({error:'Booking id required.'},{status:400});if(d.customerName){if(!valid(d))return Response.json({error:'Complete the required fields.'},{status:400});if(await conflicts(user.userId,d,d.id))return Response.json({error:'That time conflicts with another booking.'},{status:409});const [updated]=await getDb().update(appointments).set(fields(d)).where(and(eq(appointments.id,d.id),eq(appointments.ownerId,user.userId))).returning();return Response.json({appointment:updated});}if(!['confirmed','completed','cancelled','no-show'].includes(d.status??''))return Response.json({error:'Invalid status.'},{status:400});const [updated]=await getDb().update(appointments).set({status:d.status}).where(and(eq(appointments.id,d.id),eq(appointments.ownerId,user.userId))).returning();return Response.json({appointment:updated});}catch{return Response.json({error:'Booking could not be updated.'},{status:500});}}
+export async function DELETE(req:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required'},{status:401});const id=Number(new URL(req.url).searchParams.get('id'));if(!id)return Response.json({error:'Booking id required.'},{status:400});await getDb().delete(appointments).where(and(eq(appointments.id,id),eq(appointments.ownerId,user.userId)));return Response.json({deleted:true});}
+function mins(v:string){const[h,m]=v.split(':').map(Number);return h*60+m}
